@@ -1,0 +1,453 @@
+function parameter = htb_SPM_preprocessing(FunRaw,FunImg,T1Raw,T1Img,FWHM,reorient)
+% H.T.B. 2020/11/26
+%% fMRI preprocessing scripts using SPM12
+%
+%% Usage: 
+%	 - htb_SPM_preprocessing(FunRaw,FunImg,T1Raw,T1Img,FWNM,reorient);
+%	 - htb_SPM_preprocessing(FunRaw,FunImg,T1Raw,T1Img,FWNM), default to do not reorient T1;
+%	 - htb_SPM_preprocessing(FunRaw,FunImg,T1Raw,T1Img,reorient), FWHM default to [4 4 4];
+%	 - htb_SPM_preprocessing(FunRaw,FunImg,T1Raw,T1Img), default to do not reorient T1, and FWHM default to [4 4 4];
+%		  
+%% Inputs:
+%	 - FunRaw: path to raw functional image; ..\FunRaw\{subject}\{run}\*.dcm;
+%	 - FunImg: path to .nii functional image; ..\FunImg\{subject}\{run}\*.nii;
+%    - T1Raw: path to raw structural image; ..\T1Raw\{subject}\*\*.dcm;
+%    - T1Img: path to .nii structural image; ..\T1Img\{subject}\*\*.nii;
+%	 - FWHM: smoothing FWHM, default to [4 4 4];
+%	 - reorient: 0 or 1, do (1) reorientT1 or not (0); default to not do;
+%
+%% Outputs:
+%	 - parameter: the preprocessing parameters for each subject, saved to subdir;
+%
+%% Preprocessing steps:
+%	 - DICOM to 4D nifti
+%	 - reorient T1 strcutural images 
+%	 - Temporal: Slice-timing
+%	 - Realign: Estimate & Reslice
+%	 - Coregister: Estimate (all EPI images to T1)
+%	 - Segment 
+%	 - Normalise (anat)
+%	 - Normalise (func)
+%	 - Check Register
+%	 - Check Normalization 
+%
+%% Dependency:
+%	- SPM 12
+%	- Htoolbox
+%	- ZhuangScripts
+%
+
+
+if ~exist('FWHM','var') | isempty(FWHM)
+	FWHM = [4 4 4];
+end
+if ~exist('reorient','var') | isempty(reorient)
+	reorient = 0;
+end
+if ~isempty(dir(fullfile(FunRaw,'**/*.dcm')))
+    prefix = '*.dcm';
+else ~isempty(dir(fullfile(FunRaw,'**/*.ima')))
+    prefix = '*.ima';
+end
+
+
+%%------------------------------DICOM to 4D nifti-----------------------------%% 
+htb_dcm24Dnii_multiruns(FunRaw,FunImg)
+% T1Raw to T1Img
+htb_dcm2nii_multiruns(T1Raw,T1Img)
+
+cd(FunImg);
+sublist = dir(FunImg);
+sublist(1:2,:) = [];
+for i = 1:length(sublist)
+    f(i,1) = sublist(i).bytes;
+end
+sublist(f~=0) = [];
+
+%%--------------------------------Preprocessing-------------------------------%%
+%% Loop subjects 
+for s = 1 : length(sublist)
+	clear subdir raw_subdir runs matlabbatch;
+	subdir = fullfile(FunImg,sublist(s).name);
+	subT1dir = fullfile(T1Img,sublist(s).name); 
+	%% Reorient the structural image before pre-processing
+	if reorient == 1
+		reorientT1(subT1dir);
+	end
+	raw_subdir = fullfile(FunRaw,sublist(s).name);
+	cd(subdir);
+	runs = dir(subdir);
+	runs(1:2,:) = [];
+	runs = cellstr(cat(1,runs.name))';
+    nruns = numel(runs);
+	
+	%% Slice timing 
+    for r = 1 : length(runs)
+        runPath = fullfile(subdir,runs{r});
+		filt = '^4D.nii$';
+		frames = inf;
+		volumes = spm_select('ExtList',runPath,filt,frames);
+		volumes_files = fullfile(runPath,cellstr(volumes));
+		matlabbatch{r}.spm.temporal.st.scans = {volumes_files};
+		% read the slice order as the input of slice-timing 
+		run_filedir = dir(fullfile(raw_subdir,runs{r})); % raw runs
+		dcm_filedir = dir(fullfile(run_filedir(1).folder,prefix));
+		dcm_file = [dcm_filedir(1).folder,'\',dcm_filedir(1).name];
+		Slice0 = dicominfo(dcm_file);
+		SliceOrder = Slice0.Private_0019_1029;
+		s0 = sort(SliceOrder);
+		if mod(numel(SliceOrder),2) == 0
+			refSlice =s0(numel(SliceOrder)/2);
+		else 
+			refSlice =s0((numel(SliceOrder)+1)/2);
+		end
+		TR = Slice0.RepetitionTime / 1000;
+		% 
+		matlabbatch{r}.spm.temporal.st.nslices = numel(SliceOrder);
+		matlabbatch{r}.spm.temporal.st.tr = TR;
+		matlabbatch{r}.spm.temporal.st.ta = TR - TR / numel(SliceOrder);
+		matlabbatch{r}.spm.temporal.st.so = SliceOrder;
+		matlabbatch{r}.spm.temporal.st.refslice = refSlice;
+		matlabbatch{r}.spm.temporal.st.prefix = 'a';
+	end
+	
+    %% Realign: Estimate & Reslice
+	for r = 1 : length(runs)
+		matlabbatch{nruns+1}.spm.spatial.realign.estwrite.data{r}(1) = cfg_dep('Slice Timing: Slice Timing Corr. Images (Sess 1)', substruct('.','val', '{}',{r}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('()',{1}, '.','files'));
+	end
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.quality = 0.9;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.sep = 4;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.fwhm = 5;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.rtm = 1;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.interp = 2;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.wrap = [0 0 0];
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.eoptions.weight = '';
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.roptions.which = [2 1];
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.roptions.interp = 4;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.roptions.wrap = [0 0 0];
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.roptions.mask = 1;
+	matlabbatch{nruns+1}.spm.spatial.realign.estwrite.roptions.prefix = 'r';
+	
+	%% Coregister: Estimate (all functional images to structural space)
+	T1dir = dir(fullfile(subT1dir,'**/s*.nii'));
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.ref(1) = {fullfile(T1dir.folder,T1dir.name)};
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.source = cfg_dep('Realign: Estimate & Reslice: Mean Image', substruct('.','val', '{}',{nruns+1}, '.','val', '{}',{1}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('.','rmean'));
+	for r = 1 : length(runs)
+		matlabbatch{nruns+2}.spm.spatial.coreg.estimate.other(r) = cfg_dep(['Realign: Estimate & Reslice: Resliced Images (Sess ',num2str(r),')'], substruct('.','val', '{}',{nruns+1}, '.','val', '{}',{1}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('.','sess', '()',{r}, '.','rfiles'));
+	end
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.eoptions.cost_fun = 'nmi';
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.eoptions.sep = [4 2];
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.eoptions.tol = [0.02 0.02 0.02 0.001 0.001 0.001 0.01 0.01 0.01 0.001 0.001 0.001];
+	matlabbatch{nruns+2}.spm.spatial.coreg.estimate.eoptions.fwhm = [7 7];
+
+    %% Segment 
+	spmpath = fileparts(which('spm'));
+    T1dir = dir(fullfile(subT1dir,'**/s*.nii'));
+	matlabbatch{nruns+3}.spm.spatial.preproc.channel.vols = {fullfile(T1dir.folder,T1dir.name)};
+	matlabbatch{nruns+3}.spm.spatial.preproc.channel.biasreg = 0.001;
+	matlabbatch{nruns+3}.spm.spatial.preproc.channel.biasfwhm = 60;
+	matlabbatch{nruns+3}.spm.spatial.preproc.channel.write = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(1).tpm = {[spmpath,'\tpm\TPM.nii,1']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(1).ngaus = 1;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(1).native = [1 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(1).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(2).tpm = {[spmpath,'\tpm\TPM.nii,2']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(2).ngaus = 1;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(2).native = [1 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(2).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(3).tpm = {[spmpath,'\tpm\TPM.nii,3']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(3).ngaus = 2;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(3).native = [1 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(3).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(4).tpm = {[spmpath,'\tpm\TPM.nii,4']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(4).ngaus = 3;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(4).native = [1 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(4).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(5).tpm = {[spmpath,'\tpm\TPM.nii,5']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(5).ngaus = 4;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(5).native = [1 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(5).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(6).tpm = {[spmpath,'\tpm\TPM.nii,6']};
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(6).ngaus = 2;
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(6).native = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.tissue(6).warped = [0 0];
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.mrf = 1;
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.cleanup = 1;
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.reg = [0 0.001 0.5 0.05 0.2];
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.affreg = 'mni';
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.fwhm = 0;
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.samp = 3;
+	matlabbatch{nruns+3}.spm.spatial.preproc.warp.write = [0 1]; % forward 
+	
+    %% Normalise (anat)
+    T1dir = dir(fullfile(subT1dir,'**/s*.nii'));
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.subj.def(1) = cfg_dep('Segment: Forward Deformations', substruct('.','val', '{}',{nruns+3}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('.','fordef', '()',{':'}));
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.subj.resample = {fullfile(T1dir.folder,T1dir.name)};
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.woptions.bb = [-78 -112 -70
+															  78 76 85];
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.woptions.vox = [2 2 2];
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.woptions.interp = 4;
+	matlabbatch{nruns+4}.spm.spatial.normalise.write.woptions.prefix = 'w';
+	
+    %% Normalise (func)
+    matlabbatch{nruns+5}.spm.spatial.normalise.write.subj.def(1) = cfg_dep('Segment: Forward Deformations', substruct('.','val', '{}',{nruns+3}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('.','fordef', '()',{':'}));
+	matlabbatch{nruns+5}.spm.spatial.normalise.write.subj.resample(1) = cfg_dep('Coregister: Estimate: Coregistered Images', substruct('.','val', '{}',{nruns+2}, '.','val', '{}',{1}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('.','cfiles'));
+	matlabbatch{nruns+5}.spm.spatial.normalise.write.woptions.bb = [-78 -112 -70
+															   78 76 85];
+	matlabbatch{nruns+5}.spm.spatial.normalise.write.woptions.vox = [2 2 2];
+	matlabbatch{nruns+5}.spm.spatial.normalise.write.woptions.interp = 4;
+	
+    %% Smooth 
+    matlabbatch{nruns+6}.spm.spatial.smooth.data(1) = cfg_dep('Normalise: Write: Normalised Images (Subj 1)', substruct('.','val', '{}',{nruns+5}, '.','val', '{}',{1}, '.','val', '{}',{1}, '.','val', '{}',{1}), substruct('()',{1}, '.','files'));
+	matlabbatch{nruns+6}.spm.spatial.smooth.fwhm = FWHM; % 体素大小的2倍
+	matlabbatch{nruns+6}.spm.spatial.smooth.dtype = 0;
+	matlabbatch{nruns+6}.spm.spatial.smooth.im = 0;
+	matlabbatch{nruns+6}.spm.spatial.smooth.prefix = 's';
+	
+	%% run SPM for that subject
+	spm('defaults', 'FMRI');
+    spm_jobman('run', matlabbatch);
+	parameter = matlabbatch;
+	save([subdir,'\','preprocessing_paramater_sub',num2str(s,'%02d'),'.mat'],'parameter');
+	
+	%% Check Register
+	temp1 = dir(fullfile(FunImg,'**/meana4D*.nii'));
+	temp2 = dir(fullfile(subT1dir,'**/s*.nii'));
+	meanEPI = fullfile(temp1.folder,temp1.name);
+	anat = fullfile(temp2.folder,temp2.name);
+	for r = 1 : length(runs)
+		clear matlabbatch;
+        % runPath = fullfile(subdir,runs{r});
+		% func = dir(fullfile(runPath,'**/meana4D*.nii')); clear curr;
+		temp3 = {meanEPI;anat}; 
+	    matlabbatch{1}.spm.util.checkreg.data = temp3; clear temp*;
+        matlabbatch{2}.spm.util.print.fname = [subdir,'\','CheckReg_run_',num2str(r,'%02d')];
+        matlabbatch{2}.spm.util.print.fig.figname = 'Check Registration';
+        matlabbatch{2}.spm.util.print.opts = 'png';
+        spm_jobman('run', matlabbatch);
+    end
+	
+	%% Check Normalization 
+	MNItemplate  = fullfile(spmpath,'canonical/avg152T2.nii');
+	for r = 1 : length(runs)
+		clear matlabbatch;
+        runPath = fullfile(subdir,runs{r});
+		func = dir(fullfile(runPath,'**/wra4D*.nii')); clear curr;
+		curr= {fullfile(func.folder,func.name); MNItemplate};
+	    matlabbatch{1}.spm.util.checkreg.data = curr;
+        matlabbatch{2}.spm.util.print.fname = [subdir,'\','CheckNorm_run_',num2str(r,'%02d')];
+        matlabbatch{2}.spm.util.print.fig.figname = 'Check Normalization';
+        matlabbatch{2}.spm.util.print.opts = 'png';
+        spm_jobman('run', matlabbatch);
+    end
+end
+
+
+%%--------------------------------Subfunctions--------------------------------%%
+
+function htb_dcm24Dnii_multiruns(FunRaw,FunImg)
+% H.T.B. 2020/11/26
+% Convert dicom data to 4D nifti data using SPM12, for MULTI runs file structure:
+% ...\FunRaw\{Subjects}\{Runs}\*.dcm 
+%
+%% Usage: htb_dcm2nii(FunRaw,FunImg)
+%% Input:
+%	- FunRaw: the path of raw dicom data; '...\FunRaw\{Subjects}\{Runs}\*.dcm'
+%	- FunImg: the FunImg path; '...\FunRaw\{Subjects}\{Runs}'
+%% Dependency:
+%	- merge_nii.m
+%
+
+AllSubjects = dir(FunRaw);
+AllSubjects = AllSubjects(~ismember({AllSubjects.name},{'.','..'}));
+
+% Loop Subjects
+for i=1: length(AllSubjects)
+    display(AllSubjects(i).name);
+
+    SubjectDirecotry = strcat(FunRaw,'\',AllSubjects(i).name,'\');
+    Alldata = dir(SubjectDirecotry); % runs
+    Alldata = Alldata(3:end);
+
+    % Loop Runs 
+    for j=1:length(Alldata) % runs
+        clear files
+        MyOutput = strcat(FunImg,'\', AllSubjects(i).name,'\', Alldata(j).name); % FunImg\{Subjests}\{Runs}
+        mkdir(MyOutput);
+
+        MyData = Alldata(j);
+        MyDirectory = strcat(SubjectDirecotry,MyData.name); 
+        allfile = dir(MyDirectory);
+        allfile = allfile([allfile.isdir] ~= 1);
+		
+        for m=1:length(allfile)
+            files{m,:} = fullfile(MyDirectory,allfile(m).name); % all the path of .dcm in cells
+        end
+		
+        matlabbatch{1}.spm.util.import.dicom.data = files;
+        matlabbatch{1}.spm.util.import.dicom.root = 'flat'; % 'patid'
+        matlabbatch{1}.spm.util.import.dicom.outdir = {MyOutput};
+		matlabbatch{1}.spm.util.import.dicom.protfilter = '.*'; % filter the files with prefix
+        matlabbatch{1}.spm.util.import.dicom.convopts.format = 'nii'; % 'nii' or 'img'
+        matlabbatch{1}.spm.util.import.dicom.convopts.icedims = 0;
+
+        spm('defaults', 'FMRI');
+        spm_jobman('serial', matlabbatch);
+	end
+	 merge_nii(strcat(FunImg,'\', AllSubjects(i).name));
+end
+end
+
+
+function merge_nii(rawpath)
+%% Merge 3D .nii data to 4D .nii data
+%
+% H.T.B. 2020/11/26
+%-------------------------------------------------------------------------%
+%% Dependency
+%   SPM8
+%-------------------------------------------------------------------------%
+%% Input
+%   rawpath - DPABI format (FunImg/T1Img) of nii data
+%   aimpath - aim path
+%-------------------------------------------------------------------------%
+
+cd(rawpath);
+list = dir;
+list(1:2,:) = [];
+
+for i = 1:length(list)
+    cd(fullfile(rawpath,list(i).name));
+	fildir = fullfile(rawpath,list(i).name);
+	Filter = ['^*.nii$'];
+	P = spm_select('List',fildir, Filter);
+	V4 = spm_file_merge(P);
+	% movefile('4D*',[aimpath,'\',list(i).name]);
+	cellfun(@delete, cellstr(P)); % delete 3D *.nii files; 
+  
+    disp(['The operation for subject ',num2str(i),' has been finished!']);
+end
+cd(rawpath);
+end
+
+
+function htb_dcm2nii_multiruns(RawData,OutputDirectory)
+% H.T.B. 2019/9/26
+% Convert dicom data to nifti data format using SPM12, for MULTI runs file structure:
+% ...\FunImg\{Subjects}\{Runs}\*.dcm 
+%
+% Usage: htb_dcm2nii(RawData,OutputDirectory)
+% Input:
+%	- Raw_Data: the path of raw dicom data;
+%	- OutputDirectory: the FunImg path
+
+AllSubjects = dir(RawData);
+AllSubjects = AllSubjects(~ismember({AllSubjects.name},{'.','..'}));
+
+
+% Loop Subjects
+for i=1: length(AllSubjects)
+    display(AllSubjects(i).name);
+
+    SubjectDirecotry = strcat(RawData,'\',AllSubjects(i).name,'\');
+    Alldata = dir(SubjectDirecotry); % runs
+    Alldata = Alldata(3:end);
+
+    % Loop Runs 
+    for j=1:length(Alldata) % runs
+        clear files
+        MyOutput = strcat(OutputDirectory,'\', AllSubjects(i).name,'\', Alldata(j).name); % FunImg\{Subjests}\{Runs}
+        mkdir(MyOutput);
+
+        MyData = Alldata(j);
+        MyDirectory = strcat(SubjectDirecotry,MyData.name); 
+        allfile = dir(MyDirectory);
+        allfile = allfile([allfile.isdir] ~= 1);
+		
+        for m=1:length(allfile)
+            files{m,:} = fullfile(MyDirectory,allfile(m).name); % all the path of .dcm in cells
+        end
+		
+        matlabbatch{1}.spm.util.import.dicom.data = files;
+        matlabbatch{1}.spm.util.import.dicom.root = 'flat'; % 'patid'
+        matlabbatch{1}.spm.util.import.dicom.outdir = {MyOutput};
+		matlabbatch{1}.spm.util.import.dicom.protfilter = '.*'; % filter the files with prefix
+        matlabbatch{1}.spm.util.import.dicom.convopts.format = 'nii'; % 'nii' or 'img'
+        matlabbatch{1}.spm.util.import.dicom.convopts.icedims = 0;
+
+        spm('defaults', 'FMRI');
+        spm_jobman('serial', matlabbatch);
+     end
+end
+end
+
+
+function reorientT1(T1Img)
+%% Reorient the structural image before pre-processing
+% 
+%   Z.K.X. 2017/12/03
+% --------------------------------------------------------------------------------%
+%% Input
+%  -T1Img: where the T1 data are located
+%          [you can use the DPABI input format (i.e., one subject in one subfolder 
+%          under the T1Img main folder) or just put all T1 data in the
+%          same folder (i.e., T1Img folder).] '..\T1Img\{sub}\*.nii';
+% --------------------------------------------------------------------------------%
+%%
+cd(T1Img);
+list = dir;
+list = list(3:end,:);
+
+spmDir=which('spm');
+spmDir=spmDir(1:end-5);
+tmpl=[spmDir 'canonical/avg152T1.nii'];
+vg=spm_vol(tmpl);
+flags.regtype='rigid';
+
+S = dir('*.nii');
+if isempty(S) == 1;
+    for i = 1:length(list); % sublist 
+        fildir = [T1Img,'\',list(i).name]; % {subDir}
+		% fildir = dir(fullfile(T1Img,'**/*.nii'));
+        cd(fildir);
+        Filter = ['^*.nii$'];
+        p = spm_select('List',fildir, Filter);
+        for j=1:size(p,1)
+            f=strtrim(p(j,:));
+            spm_smooth(f,'temp.nii',[12 12 12]);
+            vf=spm_vol('temp.nii');
+            [M,scal] = spm_affreg(vg,vf,flags);
+            M3=M(1:3,1:3);
+            [u,~,v]=svd(M3);
+            M3=u*v';
+            M(1:3,1:3)=M3;
+            N=nifti(f);
+            N.mat=M*N.mat;
+            create(N);
+        end
+        delete('temp.nii');
+        disp(['The AC-PC reorientation for subject ',num2str(i),' has been finished!']);
+    end
+else
+    Filter = ['^*.nii$'];
+    p = spm_select('List',T1Img, Filter);
+    for i=1:size(p,1)
+        f=strtrim(p(i,:));
+        spm_smooth(f,'temp.nii',[12 12 12]);
+        vf=spm_vol('temp.nii');
+        [M,scal] = spm_affreg(vg,vf,flags);
+        M3=M(1:3,1:3);
+        [u,~,v]=svd(M3);
+        M3=u*v';
+        M(1:3,1:3)=M3;
+        N=nifti(f);
+        N.mat=M*N.mat;
+        create(N);
+        disp(['The AC-PC reorientation for subject ',num2str(i),' has been finished!']);
+    end
+    delete('temp.nii');
+	clear all;
+end
+end
+
+end
